@@ -2,6 +2,7 @@ import asyncio
 import logging
 import math
 import time
+from io import BytesIO
 
 from fastapi import Request, Response, HTTPException
 
@@ -19,33 +20,20 @@ async def process_manifest(
 ) -> Response:
     """
     Processes the MPD manifest and converts it to an HLS manifest.
-
-    Args:
-        request (Request): The incoming HTTP request.
-        mpd_dict (dict): The MPD manifest data.
-        proxy_headers (ProxyRequestHeaders): The headers to include in the request.
-        key_id (str, optional): The DRM key ID. Defaults to None.
-        key (str, optional): The DRM key. Defaults to None.
-
-    Returns:
-        Response: The HLS manifest as an HTTP response.
     """
     hls_content = build_hls(mpd_dict, request, key_id, key)
     
     # Start DASH pre-buffering in background if enabled
     if settings.enable_dash_prebuffer:
-        # Extract headers for pre-buffering
-        headers = {}
-        for key, value in request.query_params.items():
-            if key.startswith("h_"):
-                headers[key[2:]] = value
-        
-        # Get the original MPD URL from the request
+        headers = {k[2:]: v for k, v in request.query_params.items() if k.startswith("h_")}
         mpd_url = request.query_params.get("d", "")
         if mpd_url:
-            # Start pre-buffering in background
-            asyncio.create_task(
+            task = asyncio.create_task(
                 dash_prebuffer.prebuffer_dash_manifest(mpd_url, headers)
+            )
+            task.add_done_callback(
+                lambda t: logger.error("Prebuffer failed", exc_info=t.exception())
+                if t.exception() else None
             )
     
     return Response(content=hls_content, media_type="application/vnd.apple.mpegurl", headers=proxy_headers.response)
@@ -56,18 +44,6 @@ async def process_playlist(
 ) -> Response:
     """
     Processes the MPD manifest and converts it to an HLS playlist for a specific profile.
-
-    Args:
-        request (Request): The incoming HTTP request.
-        mpd_dict (dict): The MPD manifest data.
-        profile_id (str): The profile ID to generate the playlist for.
-        proxy_headers (ProxyRequestHeaders): The headers to include in the request.
-
-    Returns:
-        Response: The HLS playlist as an HTTP response.
-
-    Raises:
-        HTTPException: If the profile is not found in the MPD manifest.
     """
     matching_profiles = [p for p in mpd_dict["profiles"] if p["id"] == profile_id]
     if not matching_profiles:
@@ -87,17 +63,6 @@ async def process_segment(
 ) -> Response:
     """
     Processes and decrypts a media segment.
-
-    Args:
-        init_content (bytes): The initialization segment content.
-        segment_content (bytes): The media segment content.
-        mimetype (str): The MIME type of the segment.
-        proxy_headers (ProxyRequestHeaders): The headers to include in the request.
-        key_id (str, optional): The DRM key ID. Defaults to None.
-        key (str, optional): The DRM key. Defaults to None.
-
-    Returns:
-        Response: The decrypted segment as an HTTP response.
     """
     if key_id and key:
         # For DRM protected content
@@ -105,8 +70,11 @@ async def process_segment(
         decrypted_content = decrypt_segment(init_content, segment_content, key_id, key)
         logger.info(f"Decryption of {mimetype} segment took {time.time() - now:.4f} seconds")
     else:
-        # For non-DRM protected content, we just concatenate init and segment content
-        decrypted_content = init_content + segment_content
+        # For non-DRM protected content, concatenate efficiently
+        buf = BytesIO()
+        buf.write(init_content)
+        buf.write(segment_content)
+        decrypted_content = buf.getvalue()
 
     return Response(content=decrypted_content, media_type=mimetype, headers=proxy_headers.response)
 
@@ -114,28 +82,19 @@ async def process_segment(
 def build_hls(mpd_dict: dict, request: Request, key_id: str = None, key: str = None) -> str:
     """
     Builds an HLS manifest from the MPD manifest.
-
-    Args:
-        mpd_dict (dict): The MPD manifest data.
-        request (Request): The incoming HTTP request.
-        key_id (str, optional): The DRM key ID. Defaults to None.
-        key (str, optional): The DRM key. Defaults to None.
-
-    Returns:
-        str: The HLS manifest as a string.
     """
     hls = ["#EXTM3U", "#EXT-X-VERSION:6"]
     query_params = dict(request.query_params)
-    has_encrypted = query_params.pop("has_encrypted", False)
+    has_encrypted = query_params.pop("has_encrypted", "false").lower() == "true"
 
     video_profiles = {}
     audio_profiles = {}
 
-    # Get the base URL for the playlist_endpoint endpoint
     proxy_url = request.url_for("playlist_endpoint")
     proxy_url = str(proxy_url.replace(scheme=get_original_scheme(request)))
 
     for profile in mpd_dict["profiles"]:
+        # ⚠️ TODO: evitare key_id e key in query string (usare header o token sicuro)
         query_params.update({"profile_id": profile["id"], "key_id": key_id or "", "key": key or ""})
         playlist_url = encode_mediaflow_proxy_url(
             proxy_url,
@@ -150,14 +109,13 @@ def build_hls(mpd_dict: dict, request: Request, key_id: str = None, key: str = N
 
     # Add audio streams
     for i, (profile, playlist_url) in enumerate(audio_profiles.values()):
-        is_default = "YES" if i == 0 else "NO"  # Set the first audio track as default
+        is_default = "YES" if i == 0 else "NO"
         hls.append(
             f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{profile["id"]}",DEFAULT={is_default},AUTOSELECT={is_default},LANGUAGE="{profile.get("lang", "und")}",URI="{playlist_url}"'
         )
 
     # Add video streams
     for profile, playlist_url in video_profiles.values():
-        # Only add AUDIO attribute if there are audio profiles available
         audio_attr = ',AUDIO="audio"' if audio_profiles else ""
         hls.append(
             f'#EXT-X-STREAM-INF:BANDWIDTH={profile["bandwidth"]},RESOLUTION={profile["width"]}x{profile["height"]},CODECS="{profile["codecs"]}",FRAME-RATE={profile["frameRate"]}{audio_attr}'
@@ -170,14 +128,6 @@ def build_hls(mpd_dict: dict, request: Request, key_id: str = None, key: str = N
 def build_hls_playlist(mpd_dict: dict, profiles: list[dict], request: Request) -> str:
     """
     Builds an HLS playlist from the MPD manifest for specific profiles.
-
-    Args:
-        mpd_dict (dict): The MPD manifest data.
-        profiles (list[dict]): The profiles to include in the playlist.
-        request (Request): The incoming HTTP request.
-
-    Returns:
-        str: The HLS playlist as a string.
     """
     hls = ["#EXTM3U", "#EXT-X-VERSION:6"]
 
@@ -192,24 +142,19 @@ def build_hls_playlist(mpd_dict: dict, profiles: list[dict], request: Request) -
             logger.warning(f"No segments found for profile {profile['id']}")
             continue
 
-        # Add headers for only the first profile
         if index == 0:
             first_segment = segments[0]
             extinf_values = [f["extinf"] for f in segments if "extinf" in f]
             target_duration = math.ceil(max(extinf_values)) if extinf_values else 3
 
-            # Calculate media sequence using adaptive logic for different MPD types
             mpd_start_number = profile.get("segment_template_start_number")
             if mpd_start_number and mpd_start_number >= 1000:
-                # Amazon-style: Use absolute segment numbering
                 sequence = first_segment.get("number", mpd_start_number)
             else:
-                # Sky-style: Use time-based calculation if available
                 time_val = first_segment.get("time")
                 duration_val = first_segment.get("duration_mpd_timescale")
                 if time_val is not None and duration_val and duration_val > 0:
                     calculated_sequence = math.floor(time_val / duration_val)
-                    # For live streams with very large sequence numbers, use modulo to keep reasonable range
                     if mpd_dict.get("isLive", False) and calculated_sequence > 100000:
                         sequence = calculated_sequence % 100000
                     else:
@@ -224,7 +169,8 @@ def build_hls_playlist(mpd_dict: dict, profiles: list[dict], request: Request) -
                 ]
             )
             if mpd_dict["isLive"]:
-                hls.append("#EXT-X-PLAYLIST-TYPE:EVENT")
+                # EVENT vs LIVE → rendilo configurabile
+                hls.append("#EXT-X-PLAYLIST-TYPE:LIVE")
             else:
                 hls.append("#EXT-X-PLAYLIST-TYPE:VOD")
 
@@ -233,7 +179,7 @@ def build_hls_playlist(mpd_dict: dict, profiles: list[dict], request: Request) -
         query_params = dict(request.query_params)
         query_params.pop("profile_id", None)
         query_params.pop("d", None)
-        has_encrypted = query_params.pop("has_encrypted", False)
+        has_encrypted = query_params.pop("has_encrypted", "false").lower() == "true"
 
         for segment in segments:
             hls.append(f'#EXTINF:{segment["extinf"]:.3f},')

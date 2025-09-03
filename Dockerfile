@@ -1,38 +1,37 @@
-FROM python:3.13.5-slim
+FROM python:3.13.5-slim AS base
 
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE="1"
-ENV PYTHONUNBUFFERED="1"
-ENV PORT="8888"
+# Ambiente base
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    POETRY_VERSION=1.8.3 \
+    PATH="/home/mediaflow_proxy/.local/bin:$PATH" \
+    PORT=8888
 
-# Set work directory
 WORKDIR /mediaflow_proxy
 
-# Create a non-root user
+# Crea utente non-root
 RUN useradd -m mediaflow_proxy
-RUN chown -R mediaflow_proxy:mediaflow_proxy /mediaflow_proxy
 
-# Set up the PATH to include the user's local bin
-ENV PATH="/home/mediaflow_proxy/.local/bin:$PATH"
+# Copia solo i file necessari per la cache di Poetry
+COPY --chown=mediaflow_proxy:mediaflow_proxy pyproject.toml poetry.lock* ./
 
-# Switch to non-root user
+# Installa dipendenze in un layer unico e pulito
+RUN pip install --no-cache-dir --user poetry \
+    && poetry config virtualenvs.in-project true \
+    && poetry install --no-root --only main --no-ansi --no-interaction
+
+# Copia il resto del progetto
+COPY --chown=mediaflow_proxy:mediaflow_proxy . .
+
 USER mediaflow_proxy
 
-# Install Poetry
-RUN pip install --user --no-cache-dir poetry
-
-# Copy only requirements to cache them in docker layer
-COPY --chown=mediaflow_proxy:mediaflow_proxy pyproject.toml poetry.lock* /mediaflow_proxy/
-
-# Project initialization:
-RUN poetry config virtualenvs.in-project true \
-    && poetry install --no-interaction --no-ansi --no-root --only main
-
-# Copy project files
-COPY --chown=mediaflow_proxy:mediaflow_proxy . /mediaflow_proxy
-
-# Expose the port the app runs on
 EXPOSE 8888
 
-# Activate virtual environment and run the application with Gunicorn
-CMD ["sh", "-c", "exec poetry run gunicorn mediaflow_proxy.main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8888 --timeout 120 --max-requests 500 --max-requests-jitter 200 --access-logfile - --error-logfile - --log-level info --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\""]
+# Usa exec form, niente "sh -c" (meno overhead e più sicuro)
+CMD ["poetry", "run", "gunicorn", "mediaflow_proxy.main:app", \
+     "-w", "4", "-k", "uvicorn.workers.UvicornWorker", \
+     "--bind", "0.0.0.0:8888", "--timeout", "120", \
+     "--max-requests", "500", "--max-requests-jitter", "200", \
+     "--access-logfile", "-", "--error-logfile", "-", \
+     "--log-level", "info", \
+     "--forwarded-allow-ips", "${FORWARDED_ALLOW_IPS:-127.0.0.1}"]

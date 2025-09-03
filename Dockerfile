@@ -12,26 +12,29 @@ WORKDIR /mediaflow_proxy
 # Crea utente non-root
 RUN useradd -m mediaflow_proxy
 
-# Copia solo i file necessari per la cache di Poetry
+# Installa Poetry come root (così finisce in PATH globale)
+RUN pip install --no-cache-dir "poetry==$POETRY_VERSION"
+
+# Copia solo i file necessari per la cache delle dipendenze
 COPY --chown=mediaflow_proxy:mediaflow_proxy pyproject.toml poetry.lock* ./
 
-# Installa dipendenze in un layer unico e pulito
-RUN pip install --no-cache-dir --user poetry \
-    && poetry config virtualenvs.in-project true \
+# Installa le dipendenze (main senza dev/test)
+RUN poetry config virtualenvs.in-project true \
     && poetry install --no-root --only main --no-ansi --no-interaction
 
 # Copia il resto del progetto
 COPY --chown=mediaflow_proxy:mediaflow_proxy . .
 
+# Passa all’utente non-root
 USER mediaflow_proxy
 
 EXPOSE 8888
 
-# Usa exec form, niente "sh -c" (meno overhead e più sicuro)
+# Usa exec form (più sicuro e meno overhead)
 CMD ["poetry", "run", "gunicorn", "mediaflow_proxy.main:app", \
      "-w", "4", "-k", "uvicorn.workers.UvicornWorker", \
      "--bind", "0.0.0.0:8888", "--timeout", "120", \
      "--max-requests", "500", "--max-requests-jitter", "200", \
      "--access-logfile", "-", "--error-logfile", "-", \
      "--log-level", "info", \
-     "--forwarded-allow-ips", "${FORWARDED_ALLOW_IPS:-127.0.0.1}"]
+     "--forwarded-allow-ips", "127.0.0.1"]
